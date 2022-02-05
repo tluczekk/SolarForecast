@@ -1,0 +1,192 @@
+---
+title: "Solar Energy Forecast"
+author: "Jakub Tłuczek"
+date: "4 02 2022"
+output: html_document
+---
+## Abstract
+Following is the forecast of the total energy produced by a solar panel installation in eastern Poland. Data is collected monthly, with several exceptions whenever an inverter got broken and it wasn't possible to retrieve energy produced last month. Additionaly, data about amount of energy bought and sold each month is also included. Aim of this task is to predict the production of energy in the following year. This task has been done in order to test newly acquired knowledge in a real life use case.
+
+
+```{r libraries, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(forecast)
+library(dplyr)
+library(tsibble)
+library(imputeTS)
+library(Cairo)
+library(fable)
+library(ggplot2)
+library(feasts)
+library(fpp2)
+```
+
+## Setup
+
+Firstly, a dataset has to be loaded into environment. As raw data is being put in on a monthly basis in simple csv file, it is read in a following way:
+
+```{r setup}
+energia <- read.table("energia.csv", sep=";", header=T)
+energia <- energia %>%
+  mutate(month = yearmonth(Data)) %>%
+  select(-Data)%>%
+  as_tsibble(index = month)
+```
+
+Aside from loading the table, `Data` which is in a `%y-%m-%d` format is being replaced by `month` variable, which is then set to an index of a resulting `tsibble`.
+
+## Preprocessing
+
+Dataset includes several missing values, which have to be imputed in order to proceed. Since there has been no significant weather anomalies regarding suntime in eastern Poland, a seasonal split has been used:
+
+```{r imputacja, echo=FALSE}
+energia$Produkcja1 <- na_seasplit(energia$Produkcja1, find_frequency = T)
+energia$Produkcja2 <- na_seasplit(energia$Produkcja2, find_frequency = T)
+energia$Zakup <- na_seasplit(energia$Zakup, find_frequency = T)
+energia$Sprzedaz <- na_seasplit(energia$Sprzedaz, find_frequency = T)
+```
+```{r imputacjaploty, echo=FALSE, error=FALSE, fig.keep='all', message=FALSE, warning=FALSE, results='hide'}
+autoplot(energia, Produkcja1) +
+  labs(y="KWh", title = "Inverter 1 production",
+       x = "Month")
+autoplot(energia, Produkcja2) +
+  labs(y="KWh", title = "Inverter 2 production",
+       x = "Month")
+autoplot(energia, Zakup) +
+  labs(y="KWh", x = "Month",
+       title = "Amount of energy bought")
+autoplot(energia, Sprzedaz) +
+  labs(y="KWh", x = "Month",
+       title = "Amount of energy sold")
+```
+
+In all variables a strong seasonal trend can be noticed, where production and energy sold peaks during summer, while the amount of energy bought is noticeably higher during winter. 
+
+In the next step two calculated variables were added, namely balance of energy sold/bought, and monthly sum of energy produced.
+
+```{r add_vars}
+energia %>%
+  mutate(ProdukcjaRazem = Produkcja1 + Produkcja2, 
+         Bilans = Sprzedaz - Zakup) -> energia
+```
+```{r add_vars_ploty, echo=FALSE, error=FALSE, fig.keep='all', message=FALSE, warning=FALSE, results='hide'}
+autoplot(energia, Bilans) +
+  labs(y="KWh", x = "Month",
+       title = "Balance of energy sold/bought")
+autoplot(energia, ProdukcjaRazem) + 
+  labs(y="KWh", x = "Month",
+       title = "Total energy production")
+```
+
+## Exploration
+
+To make sure that data is indeed seasonal, which would be a valuable information in the following steps, following seasonal plots were examined:
+
+```{r exp_ploty, echo=FALSE, error=FALSE, fig.keep='all', message=FALSE, warning=FALSE, results='hide'}
+energia %>%
+  gg_season(ProdukcjaRazem) + 
+  labs(y="KWh", x="Month",
+       title = "Total energy production")
+
+energia %>%
+  gg_subseries(ProdukcjaRazem) + 
+  labs(y="KWh", x="Month",
+       title = "Total energy production")
+```
+
+As shown in the figures above, strong seasonal trend in energy production occuring in summer is clearly seen, and frankly expected - summer in northern hemisphere, and thus the most suntime, occurs in the middle of the year. Slight growing trend can also be noticed in second figure, which can be further confirmed by STL decomposition:
+
+```{r stl_ploty, echo=FALSE, error=FALSE, fig.keep='all', message=FALSE, warning=FALSE, results='hide'}
+energia %>%
+  select(month, ProdukcjaRazem) %>%
+  as_tsibble(index = month) -> energia_produkcja
+
+energia_produkcja %>%
+  stl(s.window = "periodic", robust = T) %>%
+  autoplot() + labs(title = "STL decomposition of total production")
+```
+
+There is a slightly growing trend indeed, and remainders are in tolerable range - bigger values in March and April 2020 usually  raise some questions about the correlation with the pandemic outburst and first lockdowns, yet in this case it just means that these two months were unusually sunny.
+
+## Forecasts
+
+With preprocessing and exploration done, the next step is to forecast data for upcoming months - using ARIMA, ETS and NNAR methods. In order to NNAR to work with external regressor, values of transaction balance were predicted independently, as they are not yet known.
+
+### ARIMA
+
+To find out which parameters would be good enough for non-seasonal and seasonal parts of ARIMA model, options `stepwise` and `approximation` were turned off - the best model turned out to be `ARIMA(0,0,1)(1,1,0)` with drift. 
+
+```{r arima}
+energia %>%
+  model(auto = ARIMA(ProdukcjaRazem, stepwise = F, approximation = F)) -> fit_ari
+
+forecast(fit_ari, h=12) %>%
+  filter(.model=='auto') %>%
+  hilo() %>%
+  select(-ProdukcjaRazem,-.model)
+```
+
+Corresponding plot:
+
+```{r arima_ploty, echo=FALSE, error=FALSE, fig.keep='all', message=FALSE, warning=FALSE, results='hide'}
+forecast(fit_ari, h=12) %>%
+  filter(.model=='auto') %>%
+  autoplot(energia)
+```
+
+### ETS
+
+Since data is seasonal, appropriate ETS method to deal with is Holt-Winters method. To select the one that doesn't under- or overestimate, three methods have been checked - additive, multiplicative, and multiplicative with damping:
+
+```{r ets}
+prodr <- ts(energia$ProdukcjaRazem, start = c(2016,3), frequency = 12)
+ets_add <- hw(prodr, seasonal = "additive")
+ets_mul <- hw(prodr, seasonal = "multiplicative")
+ets_dmp <- hw(prodr, damped = T, seasonal = "multiplicative")
+```
+
+```{r ets_ploty, echo=FALSE, error=FALSE, fig.keep='all', message=FALSE, warning=FALSE, results='hide'}
+autoplot(prodr) +
+  autolayer(ets_add, series = "HW Additive", PI=F) +
+  autolayer(ets_mul, series = "HW Multi", PI=F) +
+  autolayer(ets_dmp, series = "HW Multi-D", PI=F) + 
+  xlab("Month") + 
+  ylab("KWh") + 
+  ggtitle("Total Energy Production") +
+  guides(colour=guide_legend(title = "ETS method"))
+```
+
+The most stable method of these three seems to be multiplicative with damping, and it is going to be considered from here on. It is not too optimistic as mulitplicative method without damping, nor it is decaying too much with time, contrary to an observed trend.
+
+```{r multi_d}
+ets_dmp %>% forecast(h=12)
+```
+
+```{r multi_d_ploty, echo=FALSE, error=FALSE, fig.keep='all', message=FALSE, warning=FALSE, results='hide'}
+ets_dmp %>% forecast(h=12) %>% autoplot()
+```
+
+Though the forecast itself looks very similar to the one produced with ARIMA, the prediction intervals are much larger.
+
+### NNAR
+
+Last method used in the forecast is Neural Network Autoregression Model, which is not expected to outperform ARIMA  - neural networks tend to have hard time working with trending data, and although an external regressor can help greatly with explaining the data, to forecast we should have new values for this regressor. To bypass that, future values of Balance, which was chosen to be a regressor, have been independently forecasted. Each of 20 networks produced each time is then averaged to produce final model. Forecast without an external regressor:
+
+```{r NNAR_wo_x}
+fitnn <- nnetar(prodr)
+nnetforecast <- forecast(fitnn, h=12, PI = T)
+nnetforecast
+autoplot(nnetforecast)
+```
+
+Prediction intervals are again very wide, as it was the case with ARIMA model. Finally, a model using external regressor of Balance of energy sold/bought :
+
+```{r NNAR_w_x}
+fitnn2 <- nnetar(prodr, xreg = energia$Bilans)
+balance_forecast <- c(-964.29,-588.84,213.32,638.36,923.74,789.57,698.11,361.37,-363.04,-827.66,-1507.65,-1375.54)
+nnetforecast2 <- forecast(fitnn2, PI=T, xreg = balance_forecast)
+nnetforecast2
+autoplot(nnetforecast2)
+```
+
+It's interesting to see how one variable can narrow the prediction intervals, and how much accuracy one can gain by knowing it beforehand.
